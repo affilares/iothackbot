@@ -19,9 +19,10 @@ class SerialHelper:
     """
     Helper class for interacting with serial console devices.
     Handles connection, command execution, prompt detection, and output cleaning.
+    Supports both shell consoles (with prompts) and AT command interfaces (modems).
     """
 
-    # Common prompt patterns for IoT devices
+    # Common prompt patterns for IoT devices (shell consoles)
     DEFAULT_PROMPT_PATTERNS = [
         r'User@[^>]+>',           # User@/root>
         r'[#\$]\s*$',             # # or $
@@ -33,9 +34,33 @@ class SerialHelper:
         r'Password:\s*$',         # Password prompt
     ]
 
+    # AT command response patterns (cellular/satellite modems)
+    AT_RESPONSE_PATTERNS = [
+        r'^OK\s*$',               # Success response
+        r'^ERROR\s*$',            # Generic error
+        r'^\+CME ERROR:',         # Mobile equipment error
+        r'^\+CMS ERROR:',         # SMS error
+        r'^NO CARRIER\s*$',       # Connection failed
+        r'^BUSY\s*$',             # Line busy
+        r'^NO DIALTONE\s*$',      # No dial tone
+        r'^NO ANSWER\s*$',        # No answer
+        r'^CONNECT',              # Connection established
+    ]
+
+    AT_SUCCESS_PATTERNS = [r'^OK\s*$', r'^CONNECT']
+    AT_ERROR_PATTERNS = [
+        r'^ERROR\s*$',
+        r'^\+CME ERROR:',
+        r'^\+CMS ERROR:',
+        r'^NO CARRIER\s*$',
+        r'^BUSY\s*$',
+        r'^NO DIALTONE\s*$',
+        r'^NO ANSWER\s*$',
+    ]
+
     def __init__(self, device: str, baud: int = 115200, timeout: float = 3.0,
                  prompt_pattern: Optional[str] = None, debug: bool = False,
-                 logfile: Optional[str] = None):
+                 logfile: Optional[str] = None, at_mode: bool = False):
         """
         Initialize serial helper.
 
@@ -46,6 +71,7 @@ class SerialHelper:
             prompt_pattern: Custom regex pattern for prompt detection
             debug: Enable debug output
             logfile: Optional file path to log all I/O
+            at_mode: Enable AT command mode for cellular/satellite modems
         """
         self.device = device
         self.baud = baud
@@ -54,9 +80,16 @@ class SerialHelper:
         self.serial = None
         self.detected_prompt = None
         self.logfile = None
+        self.at_mode = at_mode
 
-        # Setup prompt patterns
-        if prompt_pattern:
+        # Setup patterns based on mode
+        if at_mode:
+            # AT command mode - use response terminators instead of prompts
+            self.response_patterns = [re.compile(p, re.MULTILINE) for p in self.AT_RESPONSE_PATTERNS]
+            self.success_patterns = [re.compile(p, re.MULTILINE) for p in self.AT_SUCCESS_PATTERNS]
+            self.error_patterns = [re.compile(p, re.MULTILINE) for p in self.AT_ERROR_PATTERNS]
+            self.prompt_patterns = []  # Not used in AT mode
+        elif prompt_pattern:
             self.prompt_patterns = [re.compile(prompt_pattern)]
         else:
             self.prompt_patterns = [re.compile(p) for p in self.DEFAULT_PROMPT_PATTERNS]
@@ -115,8 +148,22 @@ class SerialHelper:
             self.serial.reset_input_buffer()
             self.serial.reset_output_buffer()
 
-            if not skip_prompt_detection:
-                # Send a newline to get initial prompt
+            if self.at_mode:
+                # AT command mode - verify modem responds to basic AT command
+                self._debug_print("AT mode enabled, verifying modem response...")
+                time.sleep(0.1)
+                self._send_raw("AT\r\n")
+                time.sleep(0.3)
+                response = self._read_raw(timeout=1.0)
+                if "OK" in response:
+                    self._debug_print("AT modem detected and responding")
+                elif "ERROR" in response:
+                    self._debug_print("AT modem responded with ERROR (may need initialization)")
+                else:
+                    self._debug_print(f"Warning: AT modem may not be responding (got: {response.strip()[:50]})")
+                self._debug_print("Connected successfully (AT command mode)")
+            elif not skip_prompt_detection:
+                # Shell mode - send a newline to get initial prompt
                 self._send_raw("\r\n")
                 time.sleep(0.5)
 
@@ -245,6 +292,55 @@ class SerialHelper:
 
             time.sleep(0.05)
 
+    def _wait_for_at_response(self, timeout: Optional[float] = None) -> Tuple[str, bool, bool]:
+        """
+        Wait for AT command response (OK, ERROR, etc.)
+        Used in AT mode for cellular/satellite modems.
+
+        Args:
+            timeout: Optional custom timeout
+
+        Returns:
+            Tuple of (output, completed, success)
+            - output: Raw response text
+            - completed: True if response terminator found (OK, ERROR, etc.)
+            - success: True if OK/CONNECT, False if ERROR/NO CARRIER/etc.
+        """
+        output = ""
+        start_time = time.time()
+        timeout_val = timeout or self.timeout
+
+        while True:
+            chunk = self._read_raw(timeout=0.1)
+            if chunk:
+                output += chunk
+                self._debug_print(f"Accumulated {len(output)} chars")
+
+                # Check each line for response terminators
+                for line in output.split('\n'):
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    # Check for success patterns (OK, CONNECT)
+                    for pattern in self.success_patterns:
+                        if pattern.search(line):
+                            self._debug_print(f"AT success response detected: {line}")
+                            return output, True, True
+
+                    # Check for error patterns
+                    for pattern in self.error_patterns:
+                        if pattern.search(line):
+                            self._debug_print(f"AT error response detected: {line}")
+                            return output, True, False
+
+            # Check timeout
+            if time.time() - start_time > timeout_val:
+                self._debug_print("Timeout waiting for AT response")
+                return output, False, False
+
+            time.sleep(0.05)
+
     def _clean_output(self, raw_output: str, command: str) -> str:
         """
         Clean command output by removing echoes, prompts, and ANSI codes.
@@ -316,14 +412,22 @@ class SerialHelper:
         # Small delay to let command be processed
         time.sleep(0.1)
 
-        # Wait for prompt
-        raw_output, prompt_found = self._wait_for_prompt(timeout)
+        # Wait for response based on mode
+        if self.at_mode:
+            # AT command mode - wait for OK/ERROR response
+            raw_output, completed, success = self._wait_for_at_response(timeout)
+        else:
+            # Shell mode - wait for prompt
+            raw_output, prompt_found = self._wait_for_prompt(timeout)
+            completed = prompt_found
+            success = prompt_found
 
         # Track command
         self.command_history.append({
             'command': command,
             'timestamp': datetime.now().isoformat(),
-            'success': prompt_found,
+            'success': success,
+            'completed': completed,
             'raw_output': raw_output[:200] + '...' if len(raw_output) > 200 else raw_output
         })
 
@@ -333,8 +437,8 @@ class SerialHelper:
         else:
             output = raw_output
 
-        self._debug_print(f"Command completed. Success: {prompt_found}")
-        return output, prompt_found
+        self._debug_print(f"Command completed. Success: {success}")
+        return output, success
 
     def send_commands(self, commands: List[str], delay: float = 0.5) -> List[dict]:
         """
@@ -589,6 +693,17 @@ Examples:
 
   # Log all I/O to file (tail -f in another terminal to watch)
   %(prog)s --device /dev/ttyUSB0 --command "help" --logfile session.log
+
+  # AT command mode for cellular modems (Quectel, Sierra, u-blox, etc.)
+  %(prog)s --device /dev/ttyUSB0 --at-mode --command "AT"
+  %(prog)s --device /dev/ttyUSB0 --at-mode --command "ATI"
+  %(prog)s --device /dev/ttyUSB0 --at-mode --command "AT+CGSN"
+
+  # AT mode with batch commands
+  %(prog)s --device /dev/ttyUSB0 --at-mode --script at_commands.txt
+
+  # AT mode interactive session
+  %(prog)s --device /dev/ttyUSB0 --at-mode --interactive
         """
     )
 
@@ -601,6 +716,8 @@ Examples:
                        help='Read timeout in seconds (default: 3.0)')
     parser.add_argument('--prompt', '-p', type=str,
                        help='Custom prompt regex pattern')
+    parser.add_argument('--at-mode', '-a', action='store_true',
+                       help='AT command mode for cellular/satellite modems (uses OK/ERROR instead of prompts)')
 
     # Mode arguments (mutually exclusive)
     mode_group = parser.add_mutually_exclusive_group(required=True)
@@ -642,7 +759,8 @@ Examples:
         timeout=args.timeout,
         prompt_pattern=args.prompt,
         debug=args.debug,
-        logfile=args.logfile
+        logfile=args.logfile,
+        at_mode=args.at_mode
     )
 
     # Connect to device
